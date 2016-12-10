@@ -227,12 +227,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 dependencies = [
  "error-chain 0.7.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "libc 0.2.18 (registry+https://github.com/rust-lang/crates.io-index)",
- "sparkey-sys 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "sparkey-sys 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
 name = "sparkey-sys"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 dependencies = [
  "gcc 0.3.39 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -336,7 +336,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 "checksum scoped-pool 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)" = "817a3a15e704545ce59ed2b5c60a5d32bda4d7869befb8b36667b658a6c00b43"
 "checksum scopeguard 0.1.2 (registry+https://github.com/rust-lang/crates.io-index)" = "59a076157c1e2dc561d8de585151ee6965d910dd4dcb5dabb7ae3e83981a6c57"
 "checksum sparkey 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)" = "04aacb7f09118fcb0e9cc9c61129ca141347df62a87cc944c5357de24466dcf3"
-"checksum sparkey-sys 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)" = "a5a98d56fd30092e3af2a71d8ee78bf9031557b8d3058e112bc34659fdb0f41e"
+"checksum sparkey-sys 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)" = "89aa87d1ee2bacd0f7d9a8704589c82e1c835674d3fc7f0173010d8327e7974e"
 "checksum strsim 0.5.2 (registry+https://github.com/rust-lang/crates.io-index)" = "67f84c44fbb2f91db7fef94554e6b2ac05909c9c0b0bc23bb98d3a1aebfe7f7c"
 "checksum tempdir 0.3.5 (registry+https://github.com/rust-lang/crates.io-index)" = "87974a6f5c1dfb344d733055601650059a3363de2a6104819293baff662132d6"
 "checksum thread-id 2.0.0 (registry+https://github.com/rust-lang/crates.io-index)" = "a9539db560102d1cef46b8b78ce737ff0bb64e7e18d35b2a5688f7d097d0ff03"
