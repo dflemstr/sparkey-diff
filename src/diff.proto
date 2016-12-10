@@ -1,0 +1,34 @@
+syntax = "proto3";
+
+package spotify.sparkey;
+
+message DiffEntry {
+    oneof kind {
+        Put put = 1;
+        Delete delete = 2;
+        Patch patch = 3;
+        Header header = 4;
+    };
+
+    message Header {
+        // NOTE: this message must only contain fixed-size types!
+        fixed64 num_entries = 1;
+        fixed64 num_puts = 2;
+        fixed64 num_deletes = 3;
+        fixed64 num_patches = 4;
+    }
+
+    message Put {
+        bytes key = 1;
+        bytes value = 2;
+    }
+
+    message Delete {
+        bytes key = 1;
+    }
+
+    message Patch {
+        bytes key = 1;
+        bytes delta = 2;
+    }
+}
