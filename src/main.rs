@@ -1,29 +1,40 @@
 #![feature(plugin)]
 #![plugin(docopt_macros)]
 
-extern crate chan;
 extern crate docopt;
 #[macro_use]
 extern crate error_chain;
+extern crate jobsteal;
 extern crate num_cpus;
 extern crate pbr;
 extern crate protobuf;
 extern crate rustc_serialize;
-extern crate scoped_pool;
 extern crate sparkey;
 extern crate vcdiff;
 
 mod diff;
+mod diff_writer;
 mod error;
 
-use std::cmp;
-use std::fs;
 use std::io;
+use std::mem;
 use std::path;
+use std::sync;
+use std::thread;
 use std::time;
 
-const MAGIC: u64 = 0x4479656b72617053;
-const UNSET: u64 = 0xffffffffffffffff;
+const CHUNK_SIZE: usize = 8192;
+
+// TODO: Use some log framework
+macro_rules! errln(
+    ($($arg:tt)*) => {
+        {
+            use std::io::Write;
+            writeln!(io::stderr(), $($arg)*)
+                .expect("failed printing to stderr");
+        }
+    }
+);
 
 // This generates an Args struct that parses the following CLI
 // argument specification
@@ -95,58 +106,80 @@ fn create(paths: &Paths, assume_no_removals: bool) -> error::Result<()> {
         return Err("Checking for removals is not yet implemented".into());
     }
 
-    let num_cpus = num_cpus::get();
-    let pool = scoped_pool::Pool::new(0);
-
     let old_reader = sparkey::hash::Reader::open(paths.old_index_path,
                                                  paths.old_log_path)?;
+    errln!("Opened old index {:?} log {:?}",
+           paths.old_index_path, paths.old_log_path);
+
     let new_reader = sparkey::hash::Reader::open(paths.new_index_path,
                                                  paths.new_log_path)?;
+    errln!("Opened new index {:?} log {:?}",
+           paths.new_index_path, paths.new_log_path);
 
+    let mut pool = jobsteal::make_pool(num_cpus::get())?;
     let mut mb = pbr::MultiBar::on(io::stderr());
-    mb.println("Computing diff...");
+    mb.println("Scanning all keys...");
 
-    pool.scoped(|scope| {
-        let old_reader = &old_reader;
-        let new_reader = &new_reader;
+    let mut key_bar = mb.create_bar(new_reader.num_entries());
+    style_bar(&mut key_bar);
+    key_bar.message("Key scan ");
 
-        let (key_send, key_recv) = chan::async();
-        let (diff_send, diff_recv) = chan::async();
+    let mut diff_bar = mb.create_bar(new_reader.num_entries());
+    style_bar(&mut diff_bar);
+    diff_bar.message("Diff     ");
 
-        let mut key_bar = mb.create_bar(new_reader.num_entries());
-        style_bar(&mut key_bar);
-        key_bar.message("Key scan ");
-        execute(&pool, scope, move || {
-            send_all_keys(&new_reader, key_send, key_bar).unwrap()
-        });
+    let mut write_bar = mb.create_bar(new_reader.num_entries());
+    style_bar(&mut write_bar);
+    write_bar.message("Write    ");
 
-        let mut write_bar = mb.create_bar(new_reader.num_entries());
-        style_bar(&mut write_bar);
-        write_bar.message("Write    ");
-        execute(&pool, scope, move || {
-            write_diff(diff_recv, &paths.diff_path, write_bar).unwrap()
-        });
+    let (write_tx, write_rx) = sync::mpsc::channel();
+    let (log_diff_tx, log_diff_rx) = sync::mpsc::channel();
 
-        for i in 0..cmp::max(num_cpus - 2, 1) {
-            let key_recv = key_recv.clone();
-            let diff_send = diff_send.clone();
+    thread::spawn(move || mb.listen());
 
-            let mut diff_bar = mb.create_bar(new_reader.num_entries());
-            style_bar(&mut diff_bar);
-            diff_bar.message(&format!("Diff ({}) ", i + 1));
-            diff_bar.show_bar = false;
-            diff_bar.show_percent = false;
-            diff_bar.show_counter = false;
-            diff_bar.show_time_left = false;
+    let diff_path = paths.diff_path.to_path_buf();
+    let writer = thread::spawn(move || {
+        diff_writer::write(write_rx, &diff_path, write_bar)
+    });
+    let diff_logger = thread::spawn(move || {
+        for i in log_diff_rx {
+            diff_bar.add(i);
+        }
+        diff_bar.finish();
+    });
 
-            execute(&pool, scope, move || {
-                diff(key_recv, old_reader, new_reader, diff_send, diff_bar)
-                    .unwrap()
+    (pool.scope(|scope| {
+        for key in new_reader.keys()? {
+            let old_reader = &old_reader;
+            let new_reader = &new_reader;
+            let write_tx = write_tx.clone();
+            let log_diff_tx = log_diff_tx.clone();
+
+            key_bar.inc();
+
+            scope.submit(move || {
+                let key = key.unwrap();
+                let diff_entry = diff(key, old_reader, new_reader).unwrap();
+
+                write_tx.send(diff_entry).unwrap();
+                log_diff_tx.send(1).unwrap();
             });
         }
 
-        execute(&pool, scope, || mb.listen());
-    });
+        key_bar.finish();
+        drop(write_tx);
+        drop(log_diff_tx);
+        Ok(())
+    }) as error::Result<()>)?;
+
+    diff_logger.join().unwrap();
+    let stats = writer.join().unwrap()?;
+
+    errln!("Done writing diff {:?}", paths.diff_path);
+    errln!("Entries: {:?}", stats.num_entries);
+    errln!("Added: {:?}", stats.num_puts);
+    errln!("Deleted: {:?}", stats.num_deletes);
+    errln!("Patched: {:?}", stats.num_patches);
 
     Ok(())
 }
@@ -155,162 +188,46 @@ fn apply(paths: &Paths) -> error::Result<()> {
     Ok(())
 }
 
-fn send_all_keys<W>(reader: &sparkey::hash::Reader,
-                    key_send: chan::Sender<Vec<u8>>,
-                    mut bar: pbr::ProgressBar<W>)
-                    -> error::Result<()>
-    where W: io::Write
-{
-    for key in reader.keys()? {
-        let key = key?;
-        key_send.send(key);
-        bar.inc();
-    }
+fn diff(key: Vec<u8>,
+        old_reader: &sparkey::hash::Reader,
+        new_reader: &sparkey::hash::Reader)
+        -> error::Result<Option<diff::DiffEntry>> {
 
-    bar.finish();
+    let old_entry = old_reader.get(&key)?;
+    let new_entry = new_reader.get(&key)?;
 
-    Ok(())
-}
+    let diff_entry = match (old_entry, new_entry) {
+        (Some(a), Some(b)) => {
+            if a != b {
+                let delta =
+                    vcdiff::encode(&a, &b, vcdiff::FORMAT_INTERLEAVED, true);
 
-fn diff<W>(key_recv: chan::Receiver<Vec<u8>>,
-           old_reader: &sparkey::hash::Reader,
-           new_reader: &sparkey::hash::Reader,
-           diff_send: chan::Sender<Option<diff::DiffEntry>>,
-           mut bar: pbr::ProgressBar<W>)
-           -> error::Result<()>
-    where W: io::Write
-{
-
-    for key in key_recv {
-        let old_entry = old_reader.get(&key)?;
-        let new_entry = new_reader.get(&key)?;
-
-        let diff_entry = match (old_entry, new_entry) {
-            (Some(a), Some(b)) => {
-                if a != b {
-                    let delta = vcdiff::encode(&a,
-                                               &b,
-                                               vcdiff::FORMAT_INTERLEAVED,
-                                               true);
-
-                    let mut entry = diff::DiffEntry::new();
-                    entry.mut_patch().set_key(key);
-                    entry.mut_patch().set_delta(delta);
-
-                    Some(entry)
-                } else {
-                    None
-                }
-            }
-            (None, Some(b)) => {
                 let mut entry = diff::DiffEntry::new();
-                entry.mut_put().set_key(key);
-                entry.mut_put().set_value(b);
+                entry.mut_patch().set_key(key);
+                entry.mut_patch().set_delta(delta);
 
                 Some(entry)
+            } else {
+                None
             }
-            (Some(_), None) => {
-                let mut entry = diff::DiffEntry::new();
-                entry.mut_delete().set_key(key);
-
-                Some(entry)
-            }
-            (None, None) => unreachable!(),
-        };
-
-        diff_send.send(diff_entry);
-        bar.inc();
-    }
-
-    bar.finish();
-
-    Ok(())
-}
-
-fn write_diff<W>(diff_recv: chan::Receiver<Option<diff::DiffEntry>>,
-                 diff_path: &path::Path,
-                 mut bar: pbr::ProgressBar<W>)
-                 -> error::Result<()>
-    where W: io::Write
-{
-    use std::io::Seek;
-    use protobuf::Message;
-
-    let mut num_entries = 0;
-    let mut num_puts = 0;
-    let mut num_deletes = 0;
-    let mut num_patches = 0;
-
-    let mut diff_file = fs::File::create(diff_path)?;
-    {
-        let mut coded_out = protobuf::CodedOutputStream::new(&mut diff_file);
-
-        coded_out.write_fixed64_no_tag(MAGIC)?;
-
-        for entry in diff_recv {
-            if let Some(entry) = entry {
-                coded_out.write_raw_varint32(entry.compute_size())?;
-                entry.write_to_with_cached_sizes(&mut coded_out)?;
-
-                num_entries += 1;
-
-                if entry.has_put() {
-                    num_puts += 1;
-                }
-
-                if entry.has_delete() {
-                    num_deletes += 1;
-                }
-
-                if entry.has_patch() {
-                    num_patches += 1;
-                }
-            }
-
-            bar.inc();
         }
-    }
+        (None, Some(b)) => {
+            let mut entry = diff::DiffEntry::new();
+            entry.mut_put().set_key(key);
+            entry.mut_put().set_value(b);
 
-    diff_file.seek(io::SeekFrom::Start(8))?;
+            Some(entry)
+        }
+        (Some(_), None) => {
+            let mut entry = diff::DiffEntry::new();
+            entry.mut_delete().set_key(key);
 
-    {
-        let mut coded_out = protobuf::CodedOutputStream::new(&mut diff_file);
+            Some(entry)
+        }
+        (None, None) => unreachable!(),
+    };
 
-        write_header(&mut coded_out,
-                     num_entries,
-                     num_puts,
-                     num_deletes,
-                     num_patches)?;
-    }
-
-    bar.finish();
-
-    Ok(())
-}
-
-fn write_header(coded_out: &mut protobuf::CodedOutputStream,
-                num_entries: u64,
-                num_puts: u64,
-                num_deletes: u64,
-                num_patches: u64)
-                -> error::Result<()> {
-    use protobuf::Message;
-
-    let mut entry = diff::DiffEntry::new();
-
-    entry.mut_header().set_num_entries(smear(num_entries));
-    entry.mut_header().set_num_puts(smear(num_puts));
-    entry.mut_header().set_num_deletes(smear(num_deletes));
-    entry.mut_header().set_num_patches(smear(num_patches));
-
-    coded_out.write_raw_varint32(entry.compute_size())?;
-    entry.write_to_with_cached_sizes(coded_out)?;
-
-    Ok(())
-}
-
-fn smear(value: u64) -> u64 {
-    if value == 0 { UNSET } else { value }
+    Ok(diff_entry)
 }
 
 fn style_bar<W>(bar: &mut pbr::ProgressBar<W>)
@@ -319,13 +236,4 @@ fn style_bar<W>(bar: &mut pbr::ProgressBar<W>)
     bar.format("[=> ]");
     bar.tick_format("▏▎▍▌▋▊▉██▉▊▋▌▍▎▏");
     bar.set_max_refresh_rate(Some(time::Duration::from_millis(15)));
-}
-
-fn execute<'a, F>(pool: &scoped_pool::Pool,
-                  scope: &scoped_pool::Scope<'a>,
-                  task: F)
-    where F: FnOnce() + Send + 'a
-{
-    pool.expand();
-    scope.execute(task);
 }
