@@ -17,13 +17,10 @@ mod diff_writer;
 mod error;
 
 use std::io;
-use std::mem;
 use std::path;
 use std::sync;
 use std::thread;
 use std::time;
-
-const CHUNK_SIZE: usize = 8192;
 
 // TODO: Use some log framework
 macro_rules! errln(
@@ -149,17 +146,17 @@ fn create(paths: &Paths, assume_no_removals: bool) -> error::Result<()> {
     });
 
     (pool.scope(|scope| {
-        for key in new_reader.keys()? {
+        for entry in new_reader.log_reader().iter()? {
+            let entry = entry?;
             let old_reader = &old_reader;
-            let new_reader = &new_reader;
             let write_tx = write_tx.clone();
             let log_diff_tx = log_diff_tx.clone();
 
             key_bar.inc();
 
             scope.submit(move || {
-                let key = key.unwrap();
-                let diff_entry = diff(key, old_reader, new_reader).unwrap();
+                let old_value = old_reader.get(&entry.key).unwrap();
+                let diff_entry = diff(entry.key, old_value, Some(entry.value)).unwrap();
 
                 write_tx.send(diff_entry).unwrap();
                 log_diff_tx.send(1).unwrap();
@@ -184,19 +181,16 @@ fn create(paths: &Paths, assume_no_removals: bool) -> error::Result<()> {
     Ok(())
 }
 
-fn apply(paths: &Paths) -> error::Result<()> {
+fn apply(_paths: &Paths) -> error::Result<()> {
     Ok(())
 }
 
 fn diff(key: Vec<u8>,
-        old_reader: &sparkey::hash::Reader,
-        new_reader: &sparkey::hash::Reader)
+        old_value: Option<Vec<u8>>,
+        new_value: Option<Vec<u8>>)
         -> error::Result<Option<diff::DiffEntry>> {
 
-    let old_entry = old_reader.get(&key)?;
-    let new_entry = new_reader.get(&key)?;
-
-    let diff_entry = match (old_entry, new_entry) {
+    let diff_entry = match (old_value, new_value) {
         (Some(a), Some(b)) => {
             if a != b {
                 let delta =
