@@ -78,6 +78,7 @@ pub fn write<W>(entries: sync::mpsc::Receiver<Option<diff::DiffEntry>>,
                  num_deletes,
                  num_patches)?;
 
+    bar.message("Writer   ");
     bar.finish();
 
     Ok(Stats {

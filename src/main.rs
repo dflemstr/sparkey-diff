@@ -4,6 +4,7 @@
 extern crate docopt;
 #[macro_use]
 extern crate error_chain;
+extern crate itertools;
 extern crate jobsteal;
 extern crate num_cpus;
 extern crate pbr;
@@ -17,7 +18,6 @@ mod diff_writer;
 mod error;
 
 use std::io;
-use std::mem;
 use std::path;
 use std::sync;
 use std::thread;
@@ -102,6 +102,8 @@ fn main() {
 }
 
 fn create(paths: &Paths, assume_no_removals: bool) -> error::Result<()> {
+    use itertools::Itertools;
+
     if !assume_no_removals {
         return Err("Checking for removals is not yet implemented".into());
     }
@@ -111,8 +113,9 @@ fn create(paths: &Paths, assume_no_removals: bool) -> error::Result<()> {
     errln!("Opened old index {:?} log {:?}",
            paths.old_index_path, paths.old_log_path);
 
-    let new_reader = sparkey::hash::Reader::open(paths.new_index_path,
-                                                 paths.new_log_path)?;
+    // TODO: open index to check that entries exist...
+    // but I haven't implemented that in the Sparkey lib yet!
+    let new_reader = sparkey::log::Reader::open(paths.new_log_path)?;
     errln!("Opened new index {:?} log {:?}",
            paths.new_index_path, paths.new_log_path);
 
@@ -149,20 +152,27 @@ fn create(paths: &Paths, assume_no_removals: bool) -> error::Result<()> {
     });
 
     (pool.scope(|scope| {
-        for key in new_reader.keys()? {
+        for chunk in &new_reader.entries().chunks(CHUNK_SIZE) {
+            let chunk = chunk.collect::<sparkey::error::Result<Vec<_>>>()?;
             let old_reader = &old_reader;
-            let new_reader = &new_reader;
             let write_tx = write_tx.clone();
             let log_diff_tx = log_diff_tx.clone();
 
-            key_bar.inc();
+            key_bar.add(chunk.len() as u64);
 
             scope.submit(move || {
-                let key = key.unwrap();
-                let diff_entry = diff(key, old_reader, new_reader).unwrap();
+                let len = chunk.len();
+                for entry in chunk {
+                    let (key, new_value) = match entry {
+                        sparkey::log::Entry::Put(k, v) => (k, Some(v)),
+                        sparkey::log::Entry::Delete(k) => (k, None),
+                    };
+                    let new_value_slice = new_value.as_ref().map(|c| &**c);
+                    let diff_entry = diff(&*key, new_value_slice, old_reader).unwrap();
 
-                write_tx.send(diff_entry).unwrap();
-                log_diff_tx.send(1).unwrap();
+                    write_tx.send(diff_entry).unwrap();
+                }
+                log_diff_tx.send(len as u64).unwrap();
             });
         }
 
@@ -184,26 +194,25 @@ fn create(paths: &Paths, assume_no_removals: bool) -> error::Result<()> {
     Ok(())
 }
 
-fn apply(paths: &Paths) -> error::Result<()> {
+fn apply(_paths: &Paths) -> error::Result<()> {
     Ok(())
 }
 
-fn diff(key: Vec<u8>,
-        old_reader: &sparkey::hash::Reader,
-        new_reader: &sparkey::hash::Reader)
+fn diff(key: &[u8],
+        new_value: Option<&[u8]>,
+        old_reader: &sparkey::hash::Reader)
         -> error::Result<Option<diff::DiffEntry>> {
 
-    let old_entry = old_reader.get(&key)?;
-    let new_entry = new_reader.get(&key)?;
+    let old_value = old_reader.get(&key)?;
 
-    let diff_entry = match (old_entry, new_entry) {
+    let diff_entry = match (old_value, new_value) {
         (Some(a), Some(b)) => {
             if a != b {
                 let delta =
                     vcdiff::encode(&a, &b, vcdiff::FORMAT_INTERLEAVED, true);
 
                 let mut entry = diff::DiffEntry::new();
-                entry.mut_patch().set_key(key);
+                entry.mut_patch().set_key(key.to_vec());
                 entry.mut_patch().set_delta(delta);
 
                 Some(entry)
@@ -213,14 +222,14 @@ fn diff(key: Vec<u8>,
         }
         (None, Some(b)) => {
             let mut entry = diff::DiffEntry::new();
-            entry.mut_put().set_key(key);
-            entry.mut_put().set_value(b);
+            entry.mut_put().set_key(key.to_vec());
+            entry.mut_put().set_value(b.to_vec());
 
             Some(entry)
         }
         (Some(_), None) => {
             let mut entry = diff::DiffEntry::new();
-            entry.mut_delete().set_key(key);
+            entry.mut_delete().set_key(key.to_vec());
 
             Some(entry)
         }
