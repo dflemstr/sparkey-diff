@@ -1,29 +1,29 @@
 #![feature(plugin)]
 #![plugin(docopt_macros)]
 
+#[macro_use]
+extern crate chan;
 extern crate docopt;
 #[macro_use]
 extern crate error_chain;
-extern crate itertools;
 extern crate jobsteal;
 extern crate num_cpus;
 extern crate pbr;
 extern crate protobuf;
 extern crate rustc_serialize;
 extern crate sparkey;
+extern crate thread_scoped;
 extern crate vcdiff;
 
 mod diff;
 mod diff_writer;
 mod error;
 
+use std::borrow;
+use std::collections;
 use std::io;
 use std::path;
-use std::sync;
-use std::thread;
 use std::time;
-
-const CHUNK_SIZE: usize = 8192;
 
 // TODO: Use some log framework
 macro_rules! errln(
@@ -102,90 +102,174 @@ fn main() {
 }
 
 fn create(paths: &Paths, assume_no_removals: bool) -> error::Result<()> {
-    use itertools::Itertools;
-
     if !assume_no_removals {
         return Err("Checking for removals is not yet implemented".into());
     }
 
-    let old_reader = sparkey::hash::Reader::open(paths.old_index_path,
-                                                 paths.old_log_path)?;
-    errln!("Opened old index {:?} log {:?}",
-           paths.old_index_path, paths.old_log_path);
+    let old_reader = sparkey::log::Reader::open(paths.old_log_path)?;
+    errln!("Opened old log {:?}", paths.old_log_path);
 
-    // TODO: open index to check that entries exist...
-    // but I haven't implemented that in the Sparkey lib yet!
     let new_reader = sparkey::log::Reader::open(paths.new_log_path)?;
-    errln!("Opened new index {:?} log {:?}",
-           paths.new_index_path, paths.new_log_path);
+    errln!("Opened new log {:?}", paths.new_log_path);
+
+    create_from_readers(&old_reader, &new_reader, paths.diff_path)
+}
+
+fn create_from_readers<'a>(old_reader: &'a sparkey::log::Reader,
+                           new_reader: &'a sparkey::log::Reader,
+                           diff_path: &path::Path)
+                           -> error::Result<()> {
 
     let mut pool = jobsteal::make_pool(num_cpus::get())?;
     let mut mb = pbr::MultiBar::on(io::stderr());
-    mb.println("Scanning all keys...");
+    mb.println("Scanning all entries...");
 
-    let mut key_bar = mb.create_bar(new_reader.num_entries());
-    style_bar(&mut key_bar);
-    key_bar.message("Key scan ");
+    let mut old_bar = mb.create_bar(old_reader.num_entries());
+    style_bar(&mut old_bar);
+    old_bar.message("Scan old ");
 
-    let mut diff_bar = mb.create_bar(new_reader.num_entries());
-    style_bar(&mut diff_bar);
-    diff_bar.message("Diff     ");
+    let mut new_bar = mb.create_bar(new_reader.num_entries());
+    style_bar(&mut new_bar);
+    new_bar.message("Scan new ");
 
     let mut write_bar = mb.create_bar(new_reader.num_entries());
     style_bar(&mut write_bar);
     write_bar.message("Write    ");
 
-    let (write_tx, write_rx) = sync::mpsc::channel();
-    let (log_diff_tx, log_diff_rx) = sync::mpsc::channel();
+    let (old_tx, old_rx) = chan::async();
+    let (new_tx, new_rx) = chan::async();
+    let (write_tx, write_rx) = chan::async();
 
-    thread::spawn(move || mb.listen());
+    let _g = scoped_thread(move || mb.listen());
 
-    let diff_path = paths.diff_path.to_path_buf();
-    let writer = thread::spawn(move || {
-        diff_writer::write(write_rx, &diff_path, write_bar)
+    let writer = scoped_thread(move || {
+        diff_writer::write(write_rx, diff_path, write_bar)
     });
-    let diff_logger = thread::spawn(move || {
-        for i in log_diff_rx {
-            diff_bar.add(i);
+
+    let old_reader_thread =
+        scoped_thread(move || read_all(old_reader, old_tx, old_bar));
+
+    let new_reader_thread =
+        scoped_thread(move || read_all(new_reader, new_tx, new_bar));
+
+    pool.scope(|scope| {
+        let mut old_entries = collections::HashMap::new();
+        let mut new_entries = collections::HashMap::new();
+
+        let mut old_open = true;
+        let mut new_open = true;
+
+        enum Source<A> {
+            Old(A),
+            New(A),
         }
-        diff_bar.finish();
-    });
 
-    (pool.scope(|scope| {
-        for chunk in &new_reader.entries().chunks(CHUNK_SIZE) {
-            let chunk = chunk.collect::<sparkey::error::Result<Vec<_>>>()?;
-            let old_reader = &old_reader;
-            let write_tx = write_tx.clone();
-            let log_diff_tx = log_diff_tx.clone();
+        'outer: loop {
+            let entry;
 
-            key_bar.add(chunk.len() as u64);
+            loop {
+                match (old_open, new_open) {
+                    (true, true) => {
+                        let mut sel = chan::Select::new();
+                        let old = sel.recv(&old_rx);
+                        let new = sel.recv(&new_rx);
 
-            scope.submit(move || {
-                let len = chunk.len();
-                for entry in chunk {
-                    let (key, new_value) = match entry {
-                        sparkey::log::Entry::Put(k, v) => (k, Some(v)),
-                        sparkey::log::Entry::Delete(k) => (k, None),
-                    };
-                    let new_value_slice = new_value.as_ref().map(|c| &**c);
-                    let diff_entry = diff(&*key, new_value_slice, old_reader).unwrap();
+                        let which = sel.select();
 
-                    write_tx.send(diff_entry).unwrap();
+                        if which == old.id() {
+                            if let Some(e) = old.into_value() {
+                                entry = Source::Old(e);
+                                break;
+                            } else {
+                                old_open = false;
+                            }
+                        } else if which == new.id() {
+                            if let Some(e) = new.into_value() {
+                                entry = Source::New(e);
+                                break;
+                            } else {
+                                new_open = false;
+                            }
+                        } else {
+                            unreachable!()
+                        }
+                    },
+                    (true, false) => {
+                        if let Some(e) = old_rx.recv() {
+                            entry = Source::Old(e);
+                            break;
+                        } else {
+                            old_open = false;
+                        }
+                    },
+                    (false, true) => {
+                        if let Some(e) = new_rx.recv() {
+                            entry = Source::New(e);
+                            break;
+                        } else {
+                            new_open = false;
+                        }
+                    },
+                    (false, false) => {
+                        break 'outer;
+                    }
                 }
-                log_diff_tx.send(len as u64).unwrap();
-            });
+            }
+
+            let key = match entry {
+                Source::Old(old_entry) => {
+                    match old_entry {
+                        sparkey::log::Entry::Put(k, v) => {
+                            old_entries.insert(k.clone().into_owned(), Some(v));
+                            k.into_owned()
+                        }
+                        sparkey::log::Entry::Delete(k) => {
+                            old_entries.insert(k.clone().into_owned(), None);
+                            k.into_owned()
+                        }
+                    }
+                },
+                Source::New(new_entry) => {
+                    match new_entry {
+                        sparkey::log::Entry::Put(k, v) => {
+                            new_entries.insert(k.clone().into_owned(), Some(v));
+                            k.into_owned()
+                        }
+                        sparkey::log::Entry::Delete(k) => {
+                            new_entries.insert(k.clone().into_owned(), None);
+                            k.into_owned()
+                        }
+                    }
+                },
+            };
+
+            match (old_entries.entry(key.clone()),
+                   new_entries.entry(key.clone())) {
+                (collections::hash_map::Entry::Occupied(old),
+                 collections::hash_map::Entry::Occupied(new)) => {
+                    let old_value = old.remove();
+                    let new_value = new.remove();
+                    let write_tx = &write_tx;
+
+                    scope.submit(move || {
+                        let old_value = old_value.as_ref().map(|c| &**c);
+                        let new_value = new_value.as_ref().map(|c| &**c);
+                        let diff_entry = diff(&key, old_value, new_value);
+                        write_tx.send(diff_entry);
+                    });
+                }
+                _ => (),
+            }
         }
 
-        key_bar.finish();
-        drop(write_tx);
-        drop(log_diff_tx);
-        Ok(())
-    }) as error::Result<()>)?;
+        Ok(()) as error::Result<()>
+    })?;
 
-    diff_logger.join().unwrap();
-    let stats = writer.join().unwrap()?;
+    old_reader_thread.join()?;
+    new_reader_thread.join()?;
+    let stats = writer.join()?;
 
-    errln!("Done writing diff {:?}", paths.diff_path);
+    errln!("Done writing diff {:?}", diff_path);
     errln!("Entries: {:?}", stats.num_entries);
     errln!("Added: {:?}", stats.num_puts);
     errln!("Deleted: {:?}", stats.num_deletes);
@@ -198,14 +282,28 @@ fn apply(_paths: &Paths) -> error::Result<()> {
     Ok(())
 }
 
+fn read_all<'a, W>(
+    reader: &'a sparkey::log::Reader,
+    entry_tx: chan::Sender<sparkey::log::Entry<borrow::Cow<'a, [u8]>>>,
+    mut bar: pbr::ProgressBar<W>)
+    -> error::Result<()>
+    where W: io::Write
+{
+    for entry in reader.entries() {
+        entry_tx.send(entry?);
+        bar.inc();
+    }
+    bar.finish();
+    drop(entry_tx);
+    Ok(())
+}
+
 fn diff(key: &[u8],
         new_value: Option<&[u8]>,
-        old_reader: &sparkey::hash::Reader)
-        -> error::Result<Option<diff::DiffEntry>> {
+        old_value: Option<&[u8]>)
+        -> Option<diff::DiffEntry> {
 
-    let old_value = old_reader.get(&key)?;
-
-    let diff_entry = match (old_value, new_value) {
+    match (old_value, new_value) {
         (Some(a), Some(b)) => {
             if a != b {
                 let delta =
@@ -234,9 +332,7 @@ fn diff(key: &[u8],
             Some(entry)
         }
         (None, None) => unreachable!(),
-    };
-
-    Ok(diff_entry)
+    }
 }
 
 fn style_bar<W>(bar: &mut pbr::ProgressBar<W>)
@@ -245,4 +341,11 @@ fn style_bar<W>(bar: &mut pbr::ProgressBar<W>)
     bar.format("[=> ]");
     bar.tick_format("▏▎▍▌▋▊▉██▉▊▋▌▍▎▏");
     bar.set_max_refresh_rate(Some(time::Duration::from_millis(15)));
+}
+
+fn scoped_thread<'a, A, F>(f: F) -> thread_scoped::JoinGuard<'a, A>
+    where A: Send + 'a,
+          F: FnOnce() -> A + Send + 'a
+{
+    unsafe { thread_scoped::scoped(f) }
 }

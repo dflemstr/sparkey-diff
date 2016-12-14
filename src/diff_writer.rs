@@ -1,8 +1,8 @@
 use std::fs;
 use std::io;
 use std::path;
-use std::sync;
 
+use chan;
 use pbr;
 use protobuf;
 
@@ -19,7 +19,7 @@ pub struct Stats {
     pub num_patches: u64,
 }
 
-pub fn write<W>(entries: sync::mpsc::Receiver<Option<diff::DiffEntry>>,
+pub fn write<W>(entries: chan::Receiver<Option<diff::DiffEntry>>,
                 diff_path: &path::Path,
                 mut bar: pbr::ProgressBar<W>)
                 -> error::Result<Stats>

@@ -1,4 +1,5 @@
 use std::io;
+use std::sync;
 
 use protobuf;
 use sparkey;
@@ -10,5 +11,6 @@ error_chain! {
     foreign_links {
         IO(io::Error);
         Protobuf(protobuf::ProtobufError);
+        Recv(sync::mpsc::RecvError);
     }
 }
